@@ -16,7 +16,7 @@ def get_smpl(smpl_type="smplx"):
     if not model_file.is_file():
         raise FileNotFoundError(
             f"SMPL-X neutral model not found at {model_file}. "
-            "Download SMPL-X v1.1 and extract it there, or set SMPLX_MODEL_PATH "
+            "Download the licensed SMPL-X neutral model and extract it there, or set SMPLX_MODEL_PATH "
             "to the directory containing SMPLX_NEUTRAL.npz."
         )
 
