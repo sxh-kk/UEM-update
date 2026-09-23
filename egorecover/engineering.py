@@ -25,7 +25,16 @@ def split_takes(dataset, seed=62):
 
 class TeacherForcedFrames:
     def __init__(
-        self, dataset, codec, takes, *, clean_only=False, stride=1, history_length=20, contact_floor_source="annotation"
+        self,
+        dataset,
+        codec,
+        takes,
+        *,
+        clean_only=False,
+        stride=1,
+        history_length=20,
+        contact_floor_source="annotation",
+        bootstrap_shapes=None,
     ):
         if stride < 1:
             raise ValueError("stride must be positive.")
@@ -51,6 +60,9 @@ class TeacherForcedFrames:
                 "traj_available",
                 "previous_reference",
                 "target_joints",
+                "beta_boot",
+                "beta_boot_is_model",
+                "floor_estimate_m",
             )
         }
         self.record_ids, self.time_indices, self.floor_diagnostics = [], [], {}
@@ -82,6 +94,15 @@ class TeacherForcedFrames:
                     "target_joints": current.joints[..., :3, 3],
                     "time": time,
                     "floor": floor,
+                    "beta_boot": (
+                        bootstrap_shapes.for_record(record)
+                        if bootstrap_shapes is not None
+                        else torch.zeros(10, dtype=states.auxiliary.dtype, device=states.auxiliary.device)
+                    )
+                    .to(states.auxiliary)
+                    .expand(len(time), -1),
+                    "beta_boot_is_model": torch.full((len(time),), bootstrap_shapes is not None, dtype=torch.bool),
+                    "floor_estimate_m": torch.full((len(time),), floor, dtype=states.auxiliary.dtype),
                 }
                 self.floor_diagnostics[record["base_take_name"]] = {
                     "estimate_m": floor,
@@ -90,7 +111,17 @@ class TeacherForcedFrames:
                 }
             cached = cache[episode_id]
             time, floor = cached["time"], cached["floor"]
-            for name in ("history_motion", "base_mu", "velocity_mu", "target", "previous_reference", "target_joints"):
+            for name in (
+                "history_motion",
+                "base_mu",
+                "velocity_mu",
+                "target",
+                "previous_reference",
+                "target_joints",
+                "beta_boot",
+                "beta_boot_is_model",
+                "floor_estimate_m",
+            ):
                 fields[name].append(cached[name])
             trajectory = observed["aria_traj_obs"][time].clone()
             trajectory[:, 8] -= floor

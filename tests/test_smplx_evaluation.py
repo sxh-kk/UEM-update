@@ -84,7 +84,7 @@ def fixture_case():
 def test_saved_predictions_flow_through_fk_and_paper_geometry_metrics():
     smpl, codec, saved, supervision = fixture_case()
     gt = prepare_ground_truth(smpl, supervision, saved["frame_indices"], batch_size=2)
-    output = evaluate_saved_case(smpl, codec, saved, gt, fault_onset=21, batch_size=2)
+    output = evaluate_saved_case(smpl, codec, saved, gt, fault_window=(21, 22), batch_size=2)
     assert output["frames"] == 3
     assert output["diagnostics"]["committed_dense_max_abs_m"] < 1e-5
     assert output["diagnostics"]["fk_vs_dense_body_mm"] < 0.01
@@ -94,6 +94,7 @@ def test_saved_predictions_flow_through_fk_and_paper_geometry_metrics():
     assert output["metrics"]["mpjpe_hands_m"] == pytest.approx(0.1, abs=1e-6)
     assert output["metrics"]["mpjpe_body_pa_m"] < 1e-5
     assert output["phase_metrics"]["pre_fault"] is None
+    assert len(output["per_frame_smpl22_mm"]) == 3
 
 
 def test_incompatible_gt_asset_or_tampered_prediction_is_rejected():
@@ -104,3 +105,18 @@ def test_incompatible_gt_asset_or_tampered_prediction_is_rejected():
     saved["dense_world_joints"] = saved["dense_world_joints"] + 0.1
     with pytest.raises(ValueError, match="disagrees with saved world joints"):
         decode_committed_rollout(codec, saved)
+
+
+def test_nonfinite_recorded_gt_is_rejected_before_asset_audit():
+    smpl, _, saved, supervision = fixture_case()
+    supervision["kp3d"][20, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="Nonfinite EE4D GT recorded joints"):
+        prepare_ground_truth(smpl, supervision, saved["frame_indices"])
+
+
+def test_nonfinite_raw_smpl_gt_is_rejected_before_projection():
+    smpl, _, saved, supervision = fixture_case()
+    supervision["smpl_params"]["body_pose"] = supervision["smpl_params"]["body_pose"].copy()
+    supervision["smpl_params"]["body_pose"][20, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="Nonfinite EE4D GT SMPL-X field: body_pose"):
+        prepare_ground_truth(smpl, supervision, saved["frame_indices"])

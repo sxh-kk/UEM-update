@@ -2,7 +2,7 @@
 
 实现依据 EgoRecover 设计文档。逐阶段实验与问题见 [`LOG.md`](LOG.md)。原 E7 网络、注意力块、Flow 求解器与训练入口保持原样；新增代码从独立入口使用。
 
-当前已实现历史条件 G、当前帧 Flow、P/Q 网络、四动作、E7/EMA 初始化、几何 codec、物理缓存、在线回放、物理损失/选模、预测历史混合训练入口和经真实模型验证的离线 SMPL-X 几何评估。正式独立训练评估、SMPL22 FK 收益标签与 Q 训练仍需有效启动及正式训练集。工程 checkpoint 不是正式模型。
+当前已实现历史条件 G、当前帧 Flow、P/Q 网络、四动作、E7/EMA 初始化、几何 codec、物理缓存、在线回放、批量每样本启动体型的可微 SMPL22 FK 损失、公共启动缓存、预测历史混合训练入口和经真实模型验证的离线 SMPL-X 几何评估。正式独立训练评估、SMPL22 FK 收益标签与 Q 训练仍需训练好的 E7 启动权重及正式训练集。工程 checkpoint 不是正式模型。
 
 ## Conda 环境
 
@@ -72,7 +72,7 @@ report = load_e7_weights(model, "/linux/path/to/e7.ckpt", weight_source="ema")
 - 默认 `reference_mode="planar"`：启动、目标重编码、当前解码和缓存 reference 始终为 heading + 水平 x/y。身体关节和相机仍是三维姿态。`legacy_se3` 仅用于重现旧的自由三维参考行为；Flow 中间噪声不做平面投影。
 - 当前轨迹的 18D 后半段也连接此前提交的 reference。对齐的干净历史下与 E7 的相邻 reference 一致；预测漂移下形成需要训练适配的新输入分布。
 - `HistoryBuffer.from_bootstrap()` 只接模型生成的 20 帧启动结果；`decode_candidate()` 不写缓存；`commit()` 只接一帧预测，严格检查连续时间。β_boot 在启动后固定保存，正式 FK 解码需显式使用它；当前 dense 解码不做 SMPL FK。
-- `FixedShapeFK(smpl, beta_boot)` 接收实际 SMPL-X layer，在固定启动体型上由预测全局旋转恢复局部旋转，并以预测骨盆构造平移。可输出 55 关节与 mesh 顶点；已在真实模型和两条开发视频的保存预测上运行。FK 输出用于离线评估，不替换 dense 历史状态。
+- `FixedShapeFK(smpl, beta_boot)` 接收单个 `[10]` 或批量 `[B,10]` 启动体型，在预测骨盆与旋转上可微地运行 SMPL-X。可输出 55 关节与 mesh 顶点；已在真实模型和两条开发视频的保存预测上运行。正式 FK 损失要求每行体型来自模型生成的干净前缀，拒绝旧 GT 启动缓存；FK 输出不替换 dense 历史状态。
 - `HistoryPrior` 只读身体历史，在 codec 的物理保持先验上预测修正；`freeze()` 同时关闭梯度和 dropout，并抵抗父 module 的 `.train()`。
 - 常速度基线在世界坐标外推位置，在 SO(3) 外推身体/参考旋转；手 PCA、contact、beta 保持末帧。
 - `UtilityPredictor` 读取身体历史、μ、截至当前的观测和可选合法兼容性；在 G 前输出三个相对收益。`generate_utility_labels()` 仅离线调用，传入 a11 可用性条件和共享噪声；真实收益的 error_fn 应为公共坐标 SMPL22 FK 误差。
@@ -82,7 +82,7 @@ report = load_e7_weights(model, "/linux/path/to/e7.ckpt", weight_source="ema")
 
 ## 数据交接与验证命令
 
-已取得 `data/EE4D_MISMATCH_READY.json` 完成信号。`egorecover.data.open_dataset()` 复核状态、审计、spec/manifest 哈希后调用独立 `MismatchDataset`；不会写入数据产物。
+已取得 `data/EE4D_MISMATCH_READY.json` 完成信号。`egorecover.data.open_dataset()` 复核状态、审计、spec/manifest 哈希后调用独立 `MismatchDataset`；不会写入数据产物。交接信号现含两个 `pilot` 条目，本工程按固定 split manifest 的 spec SHA256 精确选择原 pilot 数据，不会因新增完整验证集而悄悄切换；要使用新 spec 须显式传 `spec_sha256` 并建立相应新划分。
 
 ```bash
 python -m pytest tests -q --junitxml=verification/egorecover_tests.xml
@@ -90,11 +90,11 @@ python -m run.smoke_egorecover --device cuda --output verification/egorecover_in
 python -m run.check_mismatch_adapter --output verification/mismatch_adapter.json
 ```
 
-当前 54 项测试通过，包含完整 12 层 G 的反传、四动作隔离、迁移、几何往返、连续 200 次提交的参考平面不变、身体三维姿态保留、物理损失梯度、缓存划分防泄漏、P 冻结、Q 接口及严格因果读取。全部 120 个变体、24,000 个变体帧的坐标适配在新默认 codec 下也通过，见 `verification/mismatch_adapter_planar.json`；这些不是重建精度测试。
+当前 66 项测试通过，包含完整 12 层 G 的反传、四动作隔离、迁移、几何往返、连续 200 次提交的参考平面不变、身体三维姿态保留、FK 姿态梯度与有限差分、每样本体型隔离、公共启动复用、缓存划分防泄漏、P 冻结、Q 接口及严格因果读取。全部 120 个变体、24,000 个变体帧的坐标适配在新默认 codec 下也通过，见 `verification/mismatch_adapter_planar.json`；这些不是重建精度测试。
 
 ## 可复跑的小样本工程实验
 
-仅用于已声明的官方-val 工程 take，按 take 划分 8 train / 2 dev / 2 holdout；holdout 不用于选择。全部变体随原 take。GT 历史实验的结果不能标成闭环效果。
+仅用于已声明的官方-val 工程 take；`config/egorecover_pilot_split_v1.json` 固定 8 train / 2 dev / 2 holdout，不再随训练 seed 改组；holdout 不用于选择。全部变体随原 take。`--training-seed` 与 `--sampling-seed` 独立。GT 历史实验的结果不能标成闭环效果。
 
 ```bash
 python -u -m run.engineering_pilot --output exp/my_engineering_run \
@@ -110,22 +110,40 @@ python -m run.compare_engineering_baselines --experiment exp/my_engineering_run
 
 ```bash
 python -u -m run.collect_predicted_histories --experiment exp/egorecover_engineering_v1 \
-  --output exp/my_predicted_train
+  --output exp/my_predicted_train --allow-gt-bootstrap
 python -u -m run.engineering_pilot --output exp/my_mixed_history_run \
   --prior-steps 200 --flow-steps 1000 --sigma 0.3 \
   --history-cache exp/my_predicted_train/frames.pt --replay-probability 0.5
 ```
 
-缓存由冻结的两个 G 策略生成并合并。GT 只用于训练 take 的前 20 帧启动和离线监督，之后身体历史全部来自模型提交；目标和当前轨迹都连接同一个此前预测 reference。P/G 混合采样整行字段，Gaussian/History 训练共享缓存和抽样种子。加载器检查 train take、参考模式、统计 SHA256 和有限性。这里允许的 **训练 GT 启动** 不会进入线上 `run_episode()`。
+旧工程缓存由冻结的两个 G 策略生成并合并。显式 `--allow-gt-bootstrap` 只用于重现 GT 启动诊断，正式 FK 损失会拒绝该缓存。随后身体历史全部来自模型提交；目标和当前轨迹都连接同一个此前预测 reference。P/G 混合采样整行字段，Gaussian/History 训练共享缓存和抽样种子。加载器检查 train take、参考模式、统计 SHA256、启动来源和有限性。
+
+训练好的 E7 Flow checkpoint 到位后，使用下面的共同启动/FK 对照路径；官方 diffusion checkpoint 不能代替 E7 Flow。所有 output 均须为新路径，C0/C1 使用同一划分、启动缓存、训练/采样 seed、步数、σ、NFE、动作和开发闭环选模，只改变 `--fk-weight`。此处命令是待执行协议，**目前没有有效 E7 checkpoint，也没有 C0/C1 数值**。
+
+```bash
+python -m run.cache_e7_bootstraps --checkpoint /linux/path/to/trained_e7.ckpt \
+  --weight-source model --output exp/common_e7_bootstraps.pt
+python -u -m run.engineering_pilot --output exp/c0 --checkpoint /linux/path/to/trained_e7.ckpt \
+  --bootstrap-cache exp/common_e7_bootstraps.pt --prior-steps 200 --flow-steps 1000 \
+  --sigma 0.3 --fk-weight 0 --flow-selection closed_loop_fk
+python -u -m run.engineering_pilot --output exp/c1 --checkpoint /linux/path/to/trained_e7.ckpt \
+  --bootstrap-cache exp/common_e7_bootstraps.pt --prior-steps 200 --flow-steps 1000 \
+  --sigma 0.3 --fk-weight 0.1 --flow-selection closed_loop_fk
+python -u -m run.collect_predicted_histories --experiment exp/c1 \
+  --bootstrap-cache exp/common_e7_bootstraps.pt --output exp/model_started_train
+```
+
+`closed_loop_fk` 在每个评估点以相同的干净开发 episode、E7 启动缓存和采样种子做连续预测历史回放，并用世界 SMPL22 MPJPE 选择 G checkpoint；单步 GT-history 仍只是诊断。P 当前仍在 G 训练前进行单步开发选择，不应由此声称 P 的闭环收益。需要预测历史混训时，重新指定 `--history-cache exp/model_started_train/frames.pt`，并绑定同一个启动缓存。正式训练须另建 train/val/test 及身份级协议；当前固定 split 只用于官方 val 工程验证。
 
 使用实际初始化权重进行预测历史回放：
 
 ```bash
 python -u -m run.check_closed_loop --experiment exp/my_engineering_run \
-  --output exp/my_closed_loop --bootstrap-checkpoint /linux/path/to/e7.ckpt
+  --output exp/my_closed_loop --bootstrap-checkpoint /linux/path/to/e7.ckpt \
+  --bootstrap-cache exp/common_e7_bootstraps.pt
 ```
 
-如果只有随机初始化器，必须显式指定 `--allow-random-initializer`，结果只叫稳定性诊断。可通过 `--source-modes history --variants clean` 定位故障，`--take-index 1` 检查第二个开发 take，`--reference-mode legacy_se3` 复现旧解码。推理结束后才读取标签算 dense 世界位置误差；无逐帧对齐。返回值区分 raw G `normalized_motion` 与 `committed_motion`，记录 reference_mode；`bootstrap_world_joints` 仅是初始化器预测，便于离线核查启动误差。
+如果只有随机初始化器，必须显式指定 `--allow-random-initializer` 且不传启动缓存，结果只叫稳定性诊断。可通过 `--source-modes history --variants clean` 定位故障，`--take-index 1` 检查第二个开发 take，`--reference-mode legacy_se3` 复现旧解码。公共缓存保存完整启动运动、reference、世界关节、β 与地面估计；回放重解码并逐项核验。推理结束后才读取标签算 dense 世界位置误差；无逐帧对齐。返回值区分 raw G `normalized_motion` 与 `committed_motion`，记录 reference_mode。
 
 保存闭环结果后，可对**同一模型启动身体**计算后续不再观测的保持/常速度位置基线：
 
@@ -151,6 +169,8 @@ python -m run.evaluate_closed_loop_smplx \
 评估器只读取已经完成的预测历史轨迹。每帧从保存的 `committed_motion` 和 reference 恢复预测姿态，以启动阶段模型自身的 `beta_boot` 固定体型，调用 SMPL-X 得到关节和顶点。GT 只在**推理后**用于模型资产/坐标约定审计和误差计算；GT 前 55 个身体/手部关节与给定模型重建均值需在 5 mm 内、最大值在 20 mm 内，异常则终止且不写报告。还校验恢复的 dense22 与保存轨迹相符、与原闭环报告误差相符。手/身体 MPJPE 与逐帧 PA、头部旋转与眼关节位移、足部滑动/穿透/腾空/接触均沿用原 `eval.metrics` 几何定义；足部指标使用标注地面高度，并在报告中注明。`TMR` 语义相似度和 FID 还需要独立预训练编码器及论文的采样协议，此入口不计算它们。现有 200 帧工程片段的后 180 帧，也不能直接与论文的 80 帧正式验证数值比较。
 
 已对真实保存的 12 条闭环轨迹、2160 帧完成预测状态解码预检；最大关节位置往返差 `9.53674e-7 m`，结果在 [`smplx_prediction_preflight.json`](verification/smplx_prediction_preflight.json)。实际 SMPL-X 结果见 [汇总](verification/smplx_geometry_summary.json)和两条开发视频的完整报告：[`take0`](exp/egorecover_closed_loop_v3_take0/smplx_geometry.json)、[`take1`](exp/egorecover_closed_loop_v3_take1/smplx_geometry.json)。两条 clean/Gaussian 的 SMPL22 MPJPE 分别为 172.38/261.24 mm；它们与原 dense22 的 154.58/220.95 mm 不同，因为固定体型 SMPL-X 正向运动学重新约束了预测旋转与骨长。预测 FK 与直接 dense22 平均相差 70.77/89.06 mm，根关节却几乎完全一致；这种不自洽需在后续模型训练和物理选择中处理，不能混称两类指标。
+
+Issue #3 的可重跑诊断使用 `python -m run.diagnose_fk_dense --rollout exp/egorecover_closed_loop_v3_take0 --source-mode gaussian --variant clean --output verification/my_diagnosis.json`。两条已保存的随机 E7 回放分别见 [足球体型/旋转诊断](verification/issue3_fk_dense_soccer_gaussian_clean.json)、[Covid 体型/旋转诊断](verification/issue3_fk_dense_covid_gaussian_clean.json)。新评估入口还记录逐帧/逐关节误差、root-relative MPJPE 和配对故障增量，见 [足球](verification/issue3_smplx_soccer.json)与[Covid](verification/issue3_smplx_covid.json)。GT β/旋转替换只在离线诊断脚本中使用；两条旧轨迹均为随机启动，不能据此声称方案有效。
 
 历史记录：v0（G 各 100 步）与 v1（G 各 1000 步）使用旧的自由三维 reference。v1 同组 64 帧误差为常速度 15.17 mm、P 38.15 mm、Gaussian G 152.77 mm、History G 168.24 mm；随机启动曾在索引 98 发散。当前参考系修复之后的实验另存，不覆盖这些结果，最新数值见 LOG。
 

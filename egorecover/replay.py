@@ -9,7 +9,7 @@ import torch
 
 
 class PredictedHistoryFrames:
-    def __init__(self, path, *, train_takes, reference_mode, stats_sha256=None):
+    def __init__(self, path, *, train_takes, reference_mode, stats_sha256=None, require_model_bootstrap=False):
         self.path = Path(path)
         payload = torch.load(self.path, map_location="cpu", weights_only=True, mmap=True)
         self.identity = payload["identity"]
@@ -26,6 +26,27 @@ class PredictedHistoryFrames:
         self.count = len(self.record_ids)
         if not self.count or len(payload["take_names"]) != self.count or len(self.time_indices) != self.count:
             raise ValueError("Replay metadata lengths do not match.")
+        # Older GT-start engineering caches predate shape provenance. They may
+        # still train the old dense objective, but can never pass formal FK loss.
+        if "beta_boot" not in self.tensors:
+            self.tensors = {
+                **self.tensors,
+                "beta_boot": torch.zeros(self.count, 10),
+                "beta_boot_is_model": torch.zeros(self.count, dtype=torch.bool),
+                "floor_estimate_m": torch.zeros(self.count),
+            }
+            self.identity = {**self.identity, "legacy_missing_bootstrap_shape": True}
+        if self.tensors["beta_boot"].shape != (self.count, 10) or self.tensors["beta_boot_is_model"].shape != (
+            self.count,
+        ):
+            raise ValueError("Replay bootstrap shape fields have wrong dimensions.")
+        if self.tensors["beta_boot_is_model"].dtype != torch.bool:
+            raise ValueError("Replay bootstrap provenance must be Boolean.")
+        model_bootstrap = bool(self.tensors["beta_boot_is_model"].all())
+        if model_bootstrap != bool(self.identity.get("bootstrap_is_model", False)):
+            raise ValueError("Replay bootstrap provenance disagrees with its per-frame flags.")
+        if require_model_bootstrap and not model_bootstrap:
+            raise ValueError("Formal FK training rejects GT-start or legacy predicted-history caches.")
         for key, value in self.tensors.items():
             if value.shape[0] != self.count or not bool(torch.isfinite(value).all()):
                 raise ValueError(f"Invalid/nonfinite cached field {key}.")

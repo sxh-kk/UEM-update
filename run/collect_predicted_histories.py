@@ -1,8 +1,7 @@
-"""Collect TRAINING-only predicted histories with frozen P/G and planar codec.
+"""Collect TRAINING-only predicted histories with a verified E7 startup cache.
 
-GT is used for the first 20 TRAINING frames and for offline targets. Subsequent
-histories contain only committed predictions. No dev/holdout take is collected.
-Both source policies feed one pooled cache so source training can share H/mu.
+The optional GT-start mode is a legacy diagnostic and is rejected by formal
+FK training. No development or holdout take enters this cache.
 """
 
 import argparse
@@ -13,9 +12,11 @@ import torch
 
 from config.defaults import get_cfg_defaults
 from egorecover.annotations import body_states_from_supervision
+from egorecover.bootstrap_shapes import ModelBootstrapShapes
 from egorecover.calibration import estimate_bootstrap_floor
 from egorecover.codec import BodyState, MotionCodec
 from egorecover.data import open_dataset
+from egorecover.evaluation_protocol import DEFAULT_SPLIT_MANIFEST, file_sha256, load_fixed_split
 from egorecover.history import HistoryBuffer
 from egorecover.history_flow import HistoryFlow
 from egorecover.prior import HistoryPrior
@@ -34,7 +35,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--variants", nargs="+", default=["clean", "freeze_3s", "drift_0p03mps"])
     parser.add_argument("--seed", type=int, default=62)
+    parser.add_argument("--bootstrap-cache", type=Path)
+    parser.add_argument("--allow-gt-bootstrap", action="store_true")
+    parser.add_argument("--split-manifest", type=Path, default=DEFAULT_SPLIT_MANIFEST)
     args = parser.parse_args()
+    if (args.bootstrap_cache is None) == (not args.allow_gt_bootstrap):
+        parser.error("Supply --bootstrap-cache, or explicitly choose --allow-gt-bootstrap for a diagnostic.")
     if args.output.exists():
         parser.error("Choose a new output directory.")
     args.output.mkdir(parents=True)
@@ -42,8 +48,29 @@ def main():
     device = torch.device("cuda")
     experiment = json.loads((args.experiment / "report.json").read_text())
     dataset, handoff = open_dataset()
+    splits = load_fixed_split(args.split_manifest, dataset)
+    if experiment["splits"] != splits:
+        raise ValueError("Experiment takes differ from the frozen split manifest.")
     stats_path = dataset.source.root / "uniegomotion/v4_beta_ee_train_stats.pt"
     codec = MotionCodec(torch.load(stats_path, map_location="cpu", weights_only=False)).to(device)
+    bootstraps = (
+        ModelBootstrapShapes(
+            args.bootstrap_cache,
+            allowed_takes=splits["train"] + splits["dev"] + splits["holdout"],
+            stats_sha256=file_sha256(stats_path),
+            split_manifest_sha256=file_sha256(args.split_manifest),
+            dataset_spec_sha256=file_sha256(dataset.root / "spec.json"),
+        )
+        if args.bootstrap_cache
+        else None
+    )
+    if bootstraps and bootstraps.identity.get("reference_mode") != codec.reference_mode:
+        raise ValueError("Bootstrap cache and replay use different reference conventions.")
+    if bootstraps and (
+        experiment.get("e7_checkpoint_sha256") != bootstraps.identity["e7_checkpoint_sha256"]
+        or experiment.get("e7_weight_source") != bootstraps.identity["e7_weight_source"]
+    ):
+        raise ValueError("The frozen G experiment and startup cache use different E7 weights.")
     prior = HistoryPrior().to(device)
     prior.load_state_dict(
         torch.load(args.experiment / "prior.pt", map_location=device, weights_only=True)["state_dict"]
@@ -62,6 +89,9 @@ def main():
             "traj_available",
             "previous_reference",
             "target_joints",
+            "beta_boot",
+            "beta_boot_is_model",
+            "floor_estimate_m",
         )
     }
     metadata = {key: [] for key in ("record_ids", "time_indices", "take_names", "generator_modes")}
@@ -97,12 +127,31 @@ def main():
                     floor_height=floor,
                     contact_floor_height=float(supervision["floor_height"]),
                 )
-                prefix = slice_state(states, slice(0, 20))
-                codes = codec.encode_history(
-                    BodyState(*(getattr(prefix, k)[None] for k in ("joints", "reference", "auxiliary"))),
-                    states.reference[0:1],
-                )[0]
-                buffers.append(HistoryBuffer.from_bootstrap(codec, codes, states.reference[0]))
+                if bootstraps:
+                    startup = bootstraps.startup_for_record(record)
+                    codes = startup["normalized_motion"].to(device)
+                    initial_reference = startup["initial_reference"].to(device)
+                    if abs(float(startup["floor_estimate_m"]) - floor) > 1e-5:
+                        raise ValueError("Bootstrap cache floor differs from the legal prefix estimate.")
+                else:
+                    prefix = slice_state(states, slice(0, 20))
+                    codes = codec.encode_history(
+                        BodyState(*(getattr(prefix, k)[None] for k in ("joints", "reference", "auxiliary"))),
+                        states.reference[0:1],
+                    )[0]
+                    initial_reference = states.reference[0]
+                buffer = HistoryBuffer.from_bootstrap(codec, codes, initial_reference)
+                if bootstraps and not torch.allclose(buffer.beta_boot.cpu(), startup["beta_boot"], atol=1e-5):
+                    raise ValueError("Cached E7 startup body and beta_boot disagree.")
+                if bootstraps:
+                    references = torch.stack([state.reference for state in buffer.states]).cpu()
+                    world_joints = torch.stack([state.joints[..., :3, 3] for state in buffer.states]).cpu()
+                    world_joints[..., 2] += floor
+                    if not torch.allclose(references, startup["references"], atol=1e-5, rtol=0) or not torch.allclose(
+                        world_joints, startup["world_joints"], atol=1e-4, rtol=0
+                    ):
+                        raise ValueError("Cached E7 startup references/world joints disagree with its motion.")
+                buffers.append(buffer)
                 observed.append(packet)
                 truth.append(states)
                 floors.append(floor)
@@ -130,6 +179,11 @@ def main():
                     "target": codec.encode_current(target_state, previous)[:, None],
                     "previous_reference": previous,
                     "target_joints": target_state.joints[..., :3, 3],
+                    "beta_boot": torch.stack([buffer.beta_boot for buffer in buffers]),
+                    "beta_boot_is_model": torch.full(
+                        (len(records),), bootstraps is not None, device=device, dtype=torch.bool
+                    ),
+                    "floor_estimate_m": torch.tensor(floors, device=device),
                     "traj": y["traj"],
                     "img_embs": y["img_embs"],
                     "img_available": ~y["img_mask"],
@@ -171,12 +225,20 @@ def main():
     identity = {
         "scope": "training_only_predicted_histories",
         "reference_mode": codec.reference_mode,
-        "bootstrap": "GT first 20 frames on TRAINING takes only; no resets afterwards",
+        "bootstrap": (
+            "frozen E7 clean first 20 frames on TRAINING takes; no resets"
+            if bootstraps
+            else "GT first 20 TRAINING frames; diagnostic only; no resets"
+        ),
+        "bootstrap_is_model": bootstraps is not None,
+        "bootstrap_cache_sha256": file_sha256(args.bootstrap_cache) if bootstraps else None,
+        "bootstrap_identity": bootstraps.identity if bootstraps else None,
         "policy": "a11 frozen P/G; pooled gaussian/history policies",
         "generator_experiment": str(args.experiment),
         "g_sha256": {mode: sha256(args.experiment / f"g_{mode}.pt") for mode in ("gaussian", "history")},
         "p_sha256": sha256(args.experiment / "prior.pt"),
         "stats_sha256": sha256(stats_path),
+        "split_manifest_sha256": file_sha256(args.split_manifest),
         "train_takes": experiment["splits"]["train"],
         "variants": args.variants,
         "seed": args.seed,
@@ -195,6 +257,7 @@ def main():
                 "completed": True,
             },
             indent=2,
+            allow_nan=False,
         )
         + "\n"
     )

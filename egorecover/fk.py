@@ -14,8 +14,10 @@ from utils.pca_conversions import pca_to_matrix
 class FixedShapeFK(nn.Module):
     def __init__(self, smpl, beta_boot):
         super().__init__()
-        if beta_boot.shape != (10,) or not bool(torch.isfinite(beta_boot).all()):
-            raise ValueError("Provide ten finite beta coefficients from the common model bootstrap.")
+        if (
+            beta_boot.shape != (10,) and (beta_boot.ndim != 2 or beta_boot.shape[1] != 10 or beta_boot.shape[0] < 1)
+        ) or not bool(torch.isfinite(beta_boot).all()):
+            raise ValueError("Provide finite [10] or [batch,10] beta coefficients from model bootstrap.")
         self.smpl = smpl.eval().requires_grad_(False)
         self.register_buffer("beta_boot", beta_boot.detach().clone())
         self.parents = [int(value) for value in smpl.parents[:22]]
@@ -26,7 +28,8 @@ class FixedShapeFK(nn.Module):
         ):
             raise ValueError("Expected topologically ordered SMPL22 parents.")
         with torch.no_grad():
-            root = self.smpl(betas=self.beta_boot[None], return_verts=False).joints[0, 0]
+            betas = self.beta_boot[None] if self.beta_boot.ndim == 1 else self.beta_boot
+            root = self.smpl(betas=betas, return_verts=False).joints[:, 0]
         self.register_buffer("root_offset", root.detach().clone())
 
     def train(self, mode=True):
@@ -63,11 +66,19 @@ class FixedShapeFK(nn.Module):
             dim=1,
         )
         count = len(joints)
+        if self.beta_boot.ndim == 1:
+            betas = self.beta_boot.expand(count, -1)
+            root_offset = self.root_offset.expand(count, -1)
+        else:
+            if len(self.beta_boot) != count:
+                raise ValueError("Per-sample bootstrap shapes must match the flattened body batch.")
+            betas = self.beta_boot
+            root_offset = self.root_offset
         output = self.smpl(
             global_orient=local[:, 0],
             body_pose=local[:, 1:22],
-            betas=self.beta_boot.expand(count, -1),
-            transl=joints[:, 0, :3, 3] - self.root_offset,
+            betas=betas,
+            transl=joints[:, 0, :3, 3] - root_offset,
             left_hand_pose=pca_to_matrix(auxiliary[:, :12], self.smpl.left_hand_components),
             right_hand_pose=pca_to_matrix(auxiliary[:, 12:24], self.smpl.right_hand_components),
             return_verts=return_verts,

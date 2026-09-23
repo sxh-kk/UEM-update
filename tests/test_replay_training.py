@@ -22,10 +22,43 @@ def test_replay_rejects_dev_takes_and_incompatible_coordinate_conventions(tmp_pa
         PredictedHistoryFrames(path, train_takes=["train_a"], reference_mode="legacy_se3")
     valid = PredictedHistoryFrames(path, train_takes=["train_a"], reference_mode="planar")
     assert len(valid) == 2
+    with pytest.raises(ValueError, match="rejects GT-start"):
+        PredictedHistoryFrames(path, train_takes=["train_a"], reference_mode="planar", require_model_bootstrap=True)
     payload["tensors"]["target"][0, 0, 0] = float("nan")
     torch.save(payload, path)
     with pytest.raises(ValueError, match="nonfinite"):
         PredictedHistoryFrames(path, train_takes=["train_a"], reference_mode="planar")
+
+
+def test_replay_requires_truthful_per_frame_bootstrap_provenance(tmp_path):
+    path = tmp_path / "frames.pt"
+    payload = {
+        "identity": {
+            "scope": "training_only_predicted_histories",
+            "reference_mode": "planar",
+            "bootstrap_is_model": True,
+        },
+        "tensors": {
+            "target": torch.zeros(2, 1, 243),
+            "beta_boot": torch.zeros(2, 10),
+            "beta_boot_is_model": torch.tensor([True, False]),
+            "floor_estimate_m": torch.zeros(2),
+        },
+        "record_ids": ["a", "b"],
+        "time_indices": [20, 21],
+        "take_names": ["train_a", "train_a"],
+    }
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="provenance disagrees"):
+        PredictedHistoryFrames(path, train_takes=["train_a"], reference_mode="planar")
+    payload["tensors"]["beta_boot_is_model"][:] = True
+    torch.save(payload, path)
+    assert (
+        len(
+            PredictedHistoryFrames(path, train_takes=["train_a"], reference_mode="planar", require_model_bootstrap=True)
+        )
+        == 2
+    )
 
 
 def test_replay_mixes_complete_rows_and_is_paired_by_explicit_generator():

@@ -11,6 +11,7 @@ import math
 import torch
 
 from egorecover.codec import BodyState, transform_from_9d
+from egorecover.evaluation_protocol import phase_indices
 from egorecover.fk import FixedShapeFK
 from eval.metrics import (
     compute_foot_sliding_for_smpl,
@@ -87,6 +88,11 @@ def prepare_ground_truth(smpl, supervision, frame_indices, *, batch_size=32, aud
     if frames.ndim != 1 or len(frames) < 2 or int(frames.min()) < 0 or int(frames.max()) >= total:
         raise ValueError("GT frame indices are outside the source sequence.")
     select = frames.tolist()
+    for name in ("betas", "global_orient", "body_pose", "left_hand_pose", "right_hand_pose", "transl"):
+        if not bool(torch.isfinite(_tensor(params[name], "cpu")).all()):
+            raise ValueError(f"Nonfinite EE4D GT SMPL-X field: {name}.")
+    if not math.isfinite(float(supervision["floor_height"])):
+        raise ValueError("Nonfinite EE4D GT floor height.")
     betas = _tensor(params["betas"], device).reshape(-1, 10)
     if len(betas) != 1:
         raise ValueError("This EE4D protocol expects one source shape per take.")
@@ -113,6 +119,8 @@ def prepare_ground_truth(smpl, supervision, frame_indices, *, batch_size=32, aud
         output = smpl(**{key: value[start:end] for key, value in kwargs.items()}, return_verts=True)
         if output.joints.shape[1] < 55 or output.vertices is None:
             raise ValueError("SMPL-X must expose 55 body/hand joints and vertices.")
+        if not bool(torch.isfinite(output.joints).all()) or not bool(torch.isfinite(output.vertices).all()):
+            raise ValueError("SMPL-X generated nonfinite GT geometry.")
         joints.append(output.joints[:, :55].cpu())
         vertices.append(output.vertices.cpu())
     joints = torch.cat(joints)
@@ -120,7 +128,11 @@ def prepare_ground_truth(smpl, supervision, frame_indices, *, batch_size=32, aud
     recorded = _tensor(supervision["kp3d"][select, :55], "cpu")
     if recorded.shape != joints.shape:
         raise ValueError("EE4D GT must contain the first 55 SMPL-X body/hand joints.")
+    if not bool(torch.isfinite(recorded).all()):
+        raise ValueError("Nonfinite EE4D GT recorded joints.")
     difference = (joints - recorded).norm(dim=-1)
+    if not bool(torch.isfinite(difference).all()):
+        raise ValueError("Nonfinite SMPL-X asset audit differences.")
     audit = {
         "mean_mm": float(difference.mean() * 1000),
         "max_mm": float(difference.max() * 1000),
@@ -134,8 +146,8 @@ def prepare_ground_truth(smpl, supervision, frame_indices, *, batch_size=32, aud
             "This SMPL-X asset/coordinate convention does not reproduce EE4D GT body/hand joints: "
             f"mean={audit['mean_mm']:.3f} mm, max={audit['max_mm']:.3f} mm."
         )
-    if not bool(torch.isfinite(joints).all()) or not bool(torch.isfinite(vertices).all()):
-        raise ValueError("SMPL-X generated nonfinite GT geometry.")
+    if not all(math.isfinite(value) for value in audit.values()):
+        raise ValueError("Nonfinite SMPL-X asset audit statistics.")
     return {
         "frame_indices": select,
         "joints": joints,
@@ -159,6 +171,9 @@ def _paper_geometry_metrics(
         "mpjpe_all55_m": float((pred_joints - gt_joints).norm(dim=-1).mean()),
         "mpjpe_all55_pa_m": float(reconstruction_error(pred_joints.numpy(), gt_joints.numpy())),
         "mpjpe_body_m": float((pred_body - gt_body).norm(dim=-1).mean()),
+        "mpjpe_body_root_relative_m": float(
+            ((pred_body - pred_body[:, :1]) - (gt_body - gt_body[:, :1])).norm(dim=-1).mean()
+        ),
         "mpjpe_body_pa_m": float(reconstruction_error(pred_body.numpy(), gt_body.numpy())),
         "mpjpe_hands_m": float((pred_joints[:, 25:55] - gt_joints[:, 25:55]).norm(dim=-1).mean()),
         "mpjpe_hands_pa_m": float(reconstruction_error(pred_joints[:, 25:55].numpy(), gt_joints[:, 25:55].numpy())),
@@ -180,7 +195,7 @@ def _paper_geometry_metrics(
 
 
 @torch.no_grad()
-def evaluate_saved_case(smpl, codec, saved, ground_truth, *, fault_onset, batch_size=32):
+def evaluate_saved_case(smpl, codec, saved, ground_truth, *, fault_window, batch_size=32):
     """Evaluate an already completed causal run; no online model is invoked."""
     state, beta_boot, dense_roundtrip = decode_committed_rollout(codec, saved)
     frames = list(saved["frame_indices"])
@@ -204,11 +219,7 @@ def evaluate_saved_case(smpl, codec, saved, ground_truth, *, fault_onset, batch_
     gt_head = ground_truth["head_rotation"]
     floor = ground_truth["floor_height_m"]
     overall = _paper_geometry_metrics(joints, gt_joints, vertices, gt_vertices, pred_head, gt_head, floor)
-    sections = {
-        "pre_fault": [i for i, frame in enumerate(frames) if frame < fault_onset],
-        "fault": [i for i, frame in enumerate(frames) if fault_onset <= frame < fault_onset + 30],
-        "recovery": [i for i, frame in enumerate(frames) if frame >= fault_onset + 30],
-    }
+    sections = phase_indices(frames, fault_window)
     phases = {
         name: (
             _paper_geometry_metrics(
@@ -226,10 +237,17 @@ def evaluate_saved_case(smpl, codec, saved, ground_truth, *, fault_onset, batch_
         for name, items in sections.items()
     }
     dense_error = (state.joints[..., :3, 3].cpu() - ground_truth["recorded_body"]).norm(dim=-1).mean() * 1000
+    per_joint_error = (joints[:, :22] - gt_joints[:, :22]).norm(dim=-1) * 1000
+    direct_error = (state.joints[..., :3, 3].cpu() - ground_truth["recorded_body"]).norm(dim=-1) * 1000
+    if not bool(torch.isfinite(dense_error)) or not bool(torch.isfinite(per_joint_error).all()):
+        raise ValueError("Nonfinite SMPL-X per-frame or direct-body errors.")
     return {
         "frames": len(frames),
         "metrics": overall,
         "phase_metrics": phases,
+        "per_frame_smpl22_mm": per_joint_error.mean(dim=-1).tolist(),
+        "per_frame_dense22_mm": direct_error.mean(dim=-1).tolist(),
+        "per_joint_smpl22_mean_mm": per_joint_error.mean(dim=0).tolist(),
         "diagnostics": {
             "dense22_mm_recomputed": float(dense_error),
             "committed_dense_max_abs_m": dense_roundtrip,

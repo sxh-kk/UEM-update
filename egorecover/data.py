@@ -27,15 +27,27 @@ def read_handoff(signal=DEFAULT_SIGNAL):
     return value
 
 
-def open_dataset(*, profile="pilot", signal=DEFAULT_SIGNAL):
-    handoff = read_handoff(signal)
+def select_handoff_dataset(handoff, *, profile, spec_sha256=None):
+    """Select an exact dataset identity when one handoff has multiple profiles."""
     entries = [entry for entry in handoff["datasets"] if entry["profile"] == profile]
+    if spec_sha256 is not None:
+        entries = [entry for entry in entries if entry["spec_sha256"] == spec_sha256]
     if len(entries) != 1:
-        raise ValueError(f"Expected one dataset for profile {profile!r}.")
+        raise ValueError(f"Expected one dataset for profile {profile!r} and spec {spec_sha256!r}.")
+    return entries[0]
+
+
+def open_dataset(*, profile="pilot", signal=DEFAULT_SIGNAL, spec_sha256=None):
+    handoff = read_handoff(signal)
+    if profile == "pilot" and spec_sha256 is None:
+        manifest = Path(__file__).resolve().parents[1] / "config/egorecover_pilot_split_v1.json"
+        if manifest.is_file():
+            spec_sha256 = json.loads(manifest.read_text())["dataset_spec_sha256"]
+    entry = select_handoff_dataset(handoff, profile=profile, spec_sha256=spec_sha256)
     # The dataset producer is a separate sibling package, not part of UEM.
     project = Path(handoff["code_root"]).parent
     if str(project) not in sys.path:
         sys.path.insert(0, str(project))
     from data_pipeline.ee4d_mismatch.dataset import MismatchDataset
 
-    return MismatchDataset(entries[0]["path"]), handoff
+    return MismatchDataset(entry["path"]), handoff
