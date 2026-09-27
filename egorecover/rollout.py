@@ -21,12 +21,9 @@ def initialize_history(initializer, initializer_flow, codec, prefix, *, seed=62,
         raise ValueError("Bootstrap packet must contain exactly the clean prefix.")
     if not bool(prefix["img_available"].all() & prefix["traj_available"].all()):
         raise ValueError("This protocol requires available clean startup observations.")
-    floor = estimate_bootstrap_floor(prefix, codec, length)
+    floor, encoded, references = encode_startup_observations(codec, prefix, length=length)
     trajectory = prefix["aria_traj_obs"].clone()
     trajectory[:, 8] -= floor
-    references = planar_reference(transform_from_9d(trajectory))
-    previous = torch.cat((references[:1], references[:-1]), dim=0)
-    encoded = codec.encode_observation(trajectory, previous, prefix["traj_available"])
     valid = torch.ones(1, length, device=trajectory.device, dtype=torch.bool)
     y = dict(
         traj=encoded[None],
@@ -42,7 +39,24 @@ def initialize_history(initializer, initializer_flow, codec, prefix, *, seed=62,
     predictions = initializer_flow.sample_loop(initializer, noise.shape, {"y": y}, noise=noise, repaint_enabled=False)[
         0
     ]
-    return HistoryBuffer.from_bootstrap(codec, predictions, references[0], length=length), floor, encoded
+    buffer = HistoryBuffer.from_bootstrap(codec, predictions, references[0], length=length)
+    buffer.bootstrap_motion = predictions.detach().clone()
+    return buffer, floor, encoded
+
+
+def encode_startup_observations(codec, prefix, *, length=20):
+    """Causal coordinate/floor calibration for both fresh and cached startup."""
+    if prefix["aria_traj_obs"].shape != (length, 9):
+        raise ValueError("Bootstrap packet must contain exactly the clean prefix.")
+    if not bool(prefix["img_available"].all() & prefix["traj_available"].all()):
+        raise ValueError("This protocol requires available clean startup observations.")
+    floor = estimate_bootstrap_floor(prefix, codec, length)
+    trajectory = prefix["aria_traj_obs"].clone()
+    trajectory[:, 8] -= floor
+    references = planar_reference(transform_from_9d(trajectory))
+    previous = torch.cat((references[:1], references[:-1]), dim=0)
+    encoded = codec.encode_observation(trajectory, previous, prefix["traj_available"])
+    return floor, encoded, references
 
 
 @torch.no_grad()
@@ -60,7 +74,8 @@ def run_episode(
     action="a11",
     seed=62,
     history_length=20,
-    observation_length=20
+    observation_length=20,
+    startup=None
 ):
     """observations(as_of=..., history_frames=...) returns online fields only.
 
@@ -79,11 +94,36 @@ def run_episode(
         }
 
     prefix = packet(history_length - 1, history_length)
-    buffer, floor, startup_traj = initialize_history(
-        initializer, initializer_flow, codec, prefix, seed=seed, length=history_length
-    )
+    if startup is None:
+        buffer, floor, startup_traj = initialize_history(
+            initializer, initializer_flow, codec, prefix, seed=seed, length=history_length
+        )
+    else:
+        floor, startup_traj, references = encode_startup_observations(codec, prefix, length=history_length)
+        if abs(floor - float(startup["floor_estimate_m"])) > 1e-5:
+            raise ValueError("Cached startup and current clean-prefix floor differ.")
+        buffer = HistoryBuffer.from_bootstrap(
+            codec,
+            startup["normalized_motion"].to(device),
+            startup["initial_reference"].to(device),
+            length=history_length,
+        )
+        if not torch.allclose(buffer.initial_reference, references[0], atol=1e-5, rtol=0):
+            raise ValueError("Cached startup reference differs from the legal clean prefix.")
+        if not torch.allclose(buffer.beta_boot.cpu(), startup["beta_boot"], atol=1e-5, rtol=0):
+            raise ValueError("Cached startup beta differs from its stored body motion.")
+        if not torch.allclose(
+            torch.stack([state.reference for state in buffer.states]).cpu(),
+            startup["references"],
+            atol=1e-5,
+            rtol=0,
+        ):
+            raise ValueError("Cached startup references differ from committed model motion.")
+    bootstrap_references = torch.stack([state.reference for state in buffer.states]).cpu()
     bootstrap_positions = torch.stack([state.joints[..., :3, 3] for state in buffer.states]).cpu()
     bootstrap_positions[..., 2] += floor
+    if startup is not None and not torch.allclose(bootstrap_positions, startup["world_joints"], atol=1e-4, rtol=0):
+        raise ValueError("Cached startup world joints differ from committed model motion.")
     observed_history = deque(maxlen=observation_length)
     for index in range(history_length):
         observed_history.append(
@@ -150,6 +190,12 @@ def run_episode(
     return {
         "dense_world_joints": torch.stack(positions),
         "bootstrap_world_joints": bootstrap_positions,
+        "bootstrap_references": bootstrap_references,
+        "bootstrap_motion": (
+            buffer.bootstrap_motion.cpu() if startup is None else startup["normalized_motion"].cpu().clone()
+        ),
+        "bootstrap_initial_reference": buffer.initial_reference.cpu(),
+        "bootstrap_sampling_seed": seed if startup is None else startup["sampling_seed"],
         "references": torch.stack(references),
         "normalized_motion": torch.stack(motions),
         "normalized_motion_semantics": "raw G prediction; decode using the recorded reference_mode",

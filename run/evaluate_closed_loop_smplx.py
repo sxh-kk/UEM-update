@@ -9,6 +9,7 @@ audit before any metric report is written.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import torch
 from dataset.smpl_utils import get_smpl
 from egorecover.codec import MotionCodec
 from egorecover.data import DEFAULT_SIGNAL, open_dataset
+from egorecover.evaluation_protocol import event_window, paired_fault_delta
 from egorecover.smpl_evaluation import evaluate_saved_case, prepare_ground_truth
 
 
@@ -37,6 +39,9 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--gt-audit-tolerance-mm", type=float, default=5.0)
+    parser.add_argument(
+        "--recovery-tolerance-mm", type=float, help="Predeclared development-set tolerance for paired fault recovery."
+    )
     parser.add_argument("--source-modes", nargs="+", choices=("gaussian", "history"))
     parser.add_argument("--variants", nargs="+", choices=("clean", "freeze_3s", "drift_0p03mps"))
     args = parser.parse_args()
@@ -44,6 +49,10 @@ def main():
         parser.error("Choose a new output file to preserve prior evidence.")
     if args.batch_size < 1 or args.gt_audit_tolerance_mm <= 0:
         parser.error("Batch size and GT audit tolerance must be positive.")
+    if args.recovery_tolerance_mm is not None and (
+        not math.isfinite(args.recovery_tolerance_mm) or args.recovery_tolerance_mm < 0
+    ):
+        parser.error("Recovery tolerance must be finite and nonnegative.")
     model_dir = (args.smplx_dir or Path(os.environ.get("SMPLX_MODEL_PATH", "body_models/smplx"))).expanduser()
     model_file = model_dir / "SMPLX_NEUTRAL.npz"
     if not model_file.is_file():
@@ -76,6 +85,7 @@ def main():
     ]
     if not rows or not all(row.get("finite") for row in rows):
         raise ValueError("Select at least one completed finite rollout case.")
+    selected_records = [records[row["variant"]] for row in rows]
     first_path = args.rollout / f"{rows[0]['source_mode']}_{rows[0]['variant']}.pt"
     first = torch.load(first_path, map_location="cpu", weights_only=True)
     supervision = dataset.supervision(records["clean"]["variant_id"])
@@ -90,6 +100,7 @@ def main():
     for row in rows:
         mode, variant = row["source_mode"], row["variant"]
         record = records[variant]
+        window = event_window(record, selected_records)
         trace_path = args.rollout / f"{mode}_{variant}.pt"
         saved = torch.load(trace_path, map_location="cpu", weights_only=True)
         evaluated = evaluate_saved_case(
@@ -97,7 +108,7 @@ def main():
             codec,
             saved,
             ground_truth,
-            fault_onset=record["fault_onset"],
+            fault_window=window,
             batch_size=args.batch_size,
         )
         delta = abs(evaluated["diagnostics"]["dense22_mm_recomputed"] - row["mean_dense22_mm"])
@@ -109,6 +120,7 @@ def main():
                 "variant": variant,
                 "trace_sha256": file_sha256(trace_path),
                 "fault_onset": record["fault_onset"],
+                "fault_window": list(window) if window is not None else None,
                 **evaluated,
             }
         )
@@ -117,6 +129,19 @@ def main():
             f"PA={evaluated['metrics']['mpjpe_body_pa_m']:.4f} m",
             flush=True,
         )
+    by_mode = {(result["source_mode"], result["variant"]): result for result in results}
+    for result in results:
+        if result["variant"] == "clean":
+            continue
+        clean = by_mode.get((result["source_mode"], "clean"))
+        if clean is not None and result["fault_window"] is not None:
+            result["paired_fault_delta"] = paired_fault_delta(
+                result["per_frame_smpl22_mm"],
+                clean["per_frame_smpl22_mm"],
+                first["frame_indices"],
+                result["fault_window"],
+                recovery_tolerance_mm=args.recovery_tolerance_mm,
+            )
     report = {
         "completed": True,
         "scope": "offline_Smplx_geometry_on_saved_predicted_history; official_val_engineering_pilot",
@@ -138,10 +163,11 @@ def main():
         "source_rollout_report_sha256": file_sha256(args.rollout / "report.json"),
         "gt_asset_audit": ground_truth["asset_audit"],
         "gt_audit_tolerance_mm": args.gt_audit_tolerance_mm,
+        "recovery_tolerance_mm": args.recovery_tolerance_mm,
         "results": results,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(f"Saved SMPL-X geometry report to {args.output}")
 
 

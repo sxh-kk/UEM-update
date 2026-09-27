@@ -82,3 +82,24 @@ def test_causal_rollout_calls_p_once_samples_one_action_and_ignores_masked_paylo
         assert result["frame_indices"] == list(range(20, 25))
         predictions.append(result["dense_world_joints"])
     assert torch.equal(*predictions)
+    cached = run_episode(
+        Current().eval(),
+        HistoryFlow(flow=FlowMatching(num_steps=3)),
+        Initializer().eval(),
+        FlowMatching(num_steps=3),
+        codec,
+        observations,
+        num_frames=25,
+        prior=Prior().eval(),
+        action="a00",
+        startup={
+            "normalized_motion": result["bootstrap_motion"],
+            "initial_reference": result["bootstrap_initial_reference"],
+            "beta_boot": result["beta_boot"],
+            "floor_estimate_m": result["floor_estimate_m"],
+            "sampling_seed": result["bootstrap_sampling_seed"],
+            "references": result["bootstrap_references"],
+            "world_joints": result["bootstrap_world_joints"],
+        },
+    )
+    torch.testing.assert_close(cached["dense_world_joints"], result["dense_world_joints"])
